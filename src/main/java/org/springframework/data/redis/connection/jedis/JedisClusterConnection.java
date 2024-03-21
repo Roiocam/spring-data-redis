@@ -15,11 +15,13 @@
  */
 package org.springframework.data.redis.connection.jedis;
 
+import redis.clients.jedis.ClusterPipeline;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.ConnectionPool;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisCluster;
+import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.providers.ClusterConnectionProvider;
 
 import java.time.Duration;
@@ -99,6 +101,9 @@ public class JedisClusterConnection implements RedisClusterConnection {
 	private final boolean disposeClusterCommandExecutorOnClose;
 
 	private volatile @Nullable JedisSubscription subscription;
+	@SuppressWarnings("rawtypes")
+	private List<JedisResult> pipelinedResults = new ArrayList<>();
+	private volatile @Nullable ClusterPipeline pipeline;
 
 	/**
 	 * Create new {@link JedisClusterConnection} utilizing native connections via {@link JedisCluster}.
@@ -668,17 +673,78 @@ public class JedisClusterConnection implements RedisClusterConnection {
 
 	@Override
 	public boolean isPipelined() {
-		return false;
+		return this.pipeline != null;
 	}
 
 	@Override
 	public void openPipeline() {
-		throw new InvalidDataAccessApiUsageException("Pipeline is not supported for JedisClusterConnection");
+		if (pipeline == null) {
+			pipeline = cluster.pipelined();
+		}
 	}
 
 	@Override
 	public List<Object> closePipeline() throws RedisPipelineException {
-		throw new InvalidDataAccessApiUsageException("Pipeline is not supported for JedisClusterConnection");
+		if (pipeline != null) {
+			try {
+				return convertPipelineResults();
+			} finally {
+				pipeline = null;
+				pipelinedResults.clear();
+			}
+		}
+
+		return Collections.emptyList();
+	}
+	@Nullable
+	public ClusterPipeline getPipeline() {
+		return this.pipeline;
+	}
+
+	public ClusterPipeline getRequiredPipeline() {
+
+		ClusterPipeline pipeline = getPipeline();
+
+		Assert.state(pipeline != null, "Connection has no active pipeline");
+
+		return pipeline;
+	}
+
+	private List<Object> convertPipelineResults() {
+
+		List<Object> results = new ArrayList<>();
+
+		getRequiredPipeline().sync();
+
+		Exception cause = null;
+
+		for (JedisResult<?, ?> result : pipelinedResults) {
+			try {
+
+				Object data = result.get();
+
+				if (!result.isStatus()) {
+					results.add(result.conversionRequired() ? result.convert(data) : data);
+				}
+			} catch (JedisDataException ex) {
+				DataAccessException dataAccessException = convertJedisAccessException(ex);
+				if (cause == null) {
+					cause = dataAccessException;
+				}
+				results.add(dataAccessException);
+			} catch (DataAccessException ex) {
+				if (cause == null) {
+					cause = ex;
+				}
+				results.add(ex);
+			}
+		}
+
+		if (cause != null) {
+			throw new RedisPipelineException(cause, results);
+		}
+
+		return results;
 	}
 
 	@Override
