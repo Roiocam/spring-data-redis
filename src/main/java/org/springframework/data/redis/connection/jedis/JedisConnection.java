@@ -15,24 +15,10 @@
  */
 package org.springframework.data.redis.connection.jedis;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Queue;
-import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.springframework.core.convert.converter.Converter;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
-import org.springframework.data.redis.ExceptionTranslationStrategy;
-import org.springframework.data.redis.FallbackExceptionTranslationStrategy;
-import org.springframework.data.redis.RedisSystemException;
-import org.springframework.data.redis.connection.AbstractRedisConnection;
 import org.springframework.data.redis.connection.FutureResult;
 import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.connection.RedisCommands;
@@ -42,7 +28,6 @@ import org.springframework.data.redis.connection.RedisHyperLogLogCommands;
 import org.springframework.data.redis.connection.RedisKeyCommands;
 import org.springframework.data.redis.connection.RedisListCommands;
 import org.springframework.data.redis.connection.RedisNode;
-import org.springframework.data.redis.connection.RedisPipelineException;
 import org.springframework.data.redis.connection.RedisScriptingCommands;
 import org.springframework.data.redis.connection.RedisServerCommands;
 import org.springframework.data.redis.connection.RedisSetCommands;
@@ -52,13 +37,9 @@ import org.springframework.data.redis.connection.RedisSubscribedConnectionExcept
 import org.springframework.data.redis.connection.RedisZSetCommands;
 import org.springframework.data.redis.connection.Subscription;
 import org.springframework.data.redis.connection.convert.TransactionResultConverter;
-import org.springframework.data.redis.connection.jedis.JedisInvoker.ResponseCommands;
-import org.springframework.data.redis.connection.jedis.JedisResult.JedisResultBuilder;
-import org.springframework.data.redis.connection.jedis.JedisResult.JedisStatusResult;
 import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
-
 import redis.clients.jedis.BuilderFactory;
 import redis.clients.jedis.CommandArguments;
 import redis.clients.jedis.CommandObject;
@@ -66,13 +47,17 @@ import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisClientConfig;
-import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.PipelineBase;
 import redis.clients.jedis.Response;
 import redis.clients.jedis.Transaction;
 import redis.clients.jedis.commands.ProtocolCommand;
 import redis.clients.jedis.commands.ServerCommands;
-import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.util.Pool;
+
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
+import java.util.function.Consumer;
 
 /**
  * {@code RedisConnection} implementation on top of <a href="https://github.com/redis/jedis">Jedis</a> library.
@@ -94,23 +79,13 @@ import redis.clients.jedis.util.Pool;
  * @author John Blum
  * @see redis.clients.jedis.Jedis
  */
-public class JedisConnection extends AbstractRedisConnection {
-
-	private static final ExceptionTranslationStrategy EXCEPTION_TRANSLATION =
-			new FallbackExceptionTranslationStrategy(JedisExceptionConverter.INSTANCE);
+public class JedisConnection extends AbstractPipelineRedisConnection<Jedis> {
 
 	private boolean convertPipelineAndTxResults = true;
 
 	private final Jedis jedis;
 
 	private final JedisClientConfig sentinelConfig;
-
-	private final JedisInvoker invoker = new JedisInvoker((directFunction, pipelineFunction, converter,
-			nullDefault) -> doInvoke(false, directFunction, pipelineFunction, converter, nullDefault));
-
-	private final JedisInvoker statusInvoker = new JedisInvoker((directFunction, pipelineFunction, converter,
-			nullDefault) -> doInvoke(true, directFunction, pipelineFunction, converter, nullDefault));
-
 	private volatile @Nullable JedisSubscription subscription;
 
 	private final JedisGeoCommands geoCommands = new JedisGeoCommands(this);
@@ -127,14 +102,9 @@ public class JedisConnection extends AbstractRedisConnection {
 
 	private final Log LOGGER = LogFactory.getLog(getClass());
 
-	@SuppressWarnings("rawtypes")
-	private List<JedisResult> pipelinedResults = new ArrayList<>();
-
 	private final @Nullable Pool<Jedis> pool;
 
 	private Queue<FutureResult<Response<?>>> txResults = new LinkedList<>();
-
-	private volatile @Nullable Pipeline pipeline;
 
 	private volatile @Nullable Transaction transaction;
 
@@ -204,41 +174,6 @@ public class JedisConnection extends AbstractRedisConnection {
 		return DefaultJedisClientConfig.builder().database(dbIndex).clientName(clientName).build();
 	}
 
-	@Nullable
-	private Object doInvoke(boolean status, Function<Jedis, Object> directFunction,
-			Function<ResponseCommands, Response<Object>> pipelineFunction, Converter<Object, Object> converter,
-			Supplier<Object> nullDefault) {
-
-		return doWithJedis(it -> {
-
-			if (isQueueing()) {
-
-				Response<Object> response = pipelineFunction.apply(JedisInvoker.createCommands(getRequiredTransaction()));
-				transaction(status ? newStatusResult(response) : newJedisResult(response, converter, nullDefault));
-				return null;
-			}
-
-			if (isPipelined()) {
-
-				Response<Object> response = pipelineFunction.apply(JedisInvoker.createCommands(getRequiredPipeline()));
-				pipeline(status ? newStatusResult(response) : newJedisResult(response, converter, nullDefault));
-				return null;
-			}
-
-			Object result = directFunction.apply(getJedis());
-
-			if (result == null) {
-				return nullDefault.get();
-			}
-
-			return converter.convert(result);
-		});
-	}
-
-	protected DataAccessException convertJedisAccessException(Exception cause) {
-		DataAccessException exception = EXCEPTION_TRANSLATION.translate(cause);
-		return exception != null ? exception : new RedisSystemException(cause.getMessage(), cause);
-	}
 
 	@Override
 	public RedisCommands commands() {
@@ -306,7 +241,7 @@ public class JedisConnection extends AbstractRedisConnection {
 		Assert.hasText(command, "A valid command needs to be specified");
 		Assert.notNull(args, "Arguments must not be null");
 
-		return doWithJedis(it -> {
+		return doWithClient(it -> {
 
 			ProtocolCommand protocolCommand = () -> JedisConverters.toBytes(command);
 
@@ -357,7 +292,7 @@ public class JedisConnection extends AbstractRedisConnection {
 
 	@Override
 	public boolean isClosed() {
-		return !Boolean.TRUE.equals(doWithJedis(Jedis::isConnected));
+		return !Boolean.TRUE.equals(doWithClient(Jedis::isConnected));
 	}
 
 	@Override
@@ -366,80 +301,16 @@ public class JedisConnection extends AbstractRedisConnection {
 	}
 
 	@Override
-	public boolean isPipelined() {
-		return this.pipeline != null;
+	PipelineBase newPipeline() {
+		return jedis.pipelined();
 	}
 
 	@Override
-	public void openPipeline() {
-
-		if (isQueueing()) {
-			throw new InvalidDataAccessApiUsageException("Cannot use Pipelining while a transaction is active");
-		}
-
-		if (pipeline == null) {
-			pipeline = jedis.pipelined();
-		}
-	}
-
-	@Override
-	public List<Object> closePipeline() {
-
-		if (pipeline != null) {
-			try {
-				return convertPipelineResults();
-			} finally {
-				pipeline = null;
-				pipelinedResults.clear();
-			}
-		}
-
-		return Collections.emptyList();
-	}
-
-	private List<Object> convertPipelineResults() {
-
-		List<Object> results = new ArrayList<>();
-
-		getRequiredPipeline().sync();
-
-		Exception cause = null;
-
-		for (JedisResult<?, ?> result : pipelinedResults) {
-			try {
-
-				Object data = result.get();
-
-				if (!result.isStatus()) {
-					results.add(result.conversionRequired() ? result.convert(data) : data);
-				}
-			} catch (JedisDataException ex) {
-				DataAccessException dataAccessException = convertJedisAccessException(ex);
-				if (cause == null) {
-					cause = dataAccessException;
-				}
-				results.add(dataAccessException);
-			} catch (DataAccessException ex) {
-				if (cause == null) {
-					cause = ex;
-				}
-				results.add(ex);
-			}
-		}
-
-		if (cause != null) {
-			throw new RedisPipelineException(cause, results);
-		}
-
-		return results;
-	}
-
 	void pipeline(JedisResult<?, ?> result) {
-
 		if (isQueueing()) {
 			transaction(result);
 		} else {
-			pipelinedResults.add(result);
+			super.pipeline(result);
 		}
 	}
 
@@ -497,20 +368,6 @@ public class JedisConnection extends AbstractRedisConnection {
 	}
 
 	@Nullable
-	public Pipeline getPipeline() {
-		return this.pipeline;
-	}
-
-	public Pipeline getRequiredPipeline() {
-
-		Pipeline pipeline = getPipeline();
-
-		Assert.state(pipeline != null, "Connection has no active pipeline");
-
-		return pipeline;
-	}
-
-	@Nullable
 	public Transaction getTransaction() {
 		return this.transaction;
 	}
@@ -528,39 +385,9 @@ public class JedisConnection extends AbstractRedisConnection {
 		return this.jedis;
 	}
 
-	/**
-	 * Obtain a {@link JedisInvoker} to call Jedis methods on the current {@link Jedis} instance.
-	 *
-	 * @return the {@link JedisInvoker}.
-	 * @since 2.5
-	 */
-	JedisInvoker invoke() {
-		return this.invoker;
-	}
-
-	/**
-	 * Obtain a {@link JedisInvoker} to call Jedis methods returning a status response on the current {@link Jedis}
-	 * instance. Status responses are not included in transactional and pipeline results.
-	 *
-	 * @return the {@link JedisInvoker}.
-	 * @since 2.5
-	 */
-	JedisInvoker invokeStatus() {
-		return this.statusInvoker;
-	}
-
-	<T> JedisResult<T, T> newJedisResult(Response<T> response) {
-		return JedisResultBuilder.<T, T> forResponse(response).build();
-	}
-
-	<T, R> JedisResult<T, R> newJedisResult(Response<T> response, Converter<T, R> converter, Supplier<R> defaultValue) {
-
-		return JedisResultBuilder.<T, R> forResponse(response).mappedWith(converter)
-				.convertPipelineAndTxResults(convertPipelineAndTxResults).mapNullTo(defaultValue).build();
-	}
-
-	<T> JedisStatusResult<T, T> newStatusResult(Response<T> response) {
-		return JedisResultBuilder.<T, T> forResponse(response).buildStatusResult();
+	@Override
+	Jedis getClient() {
+		return getJedis();
 	}
 
 	@Override
@@ -574,7 +401,7 @@ public class JedisConnection extends AbstractRedisConnection {
 			throw new InvalidDataAccessApiUsageException("Cannot use Transaction while a pipeline is open");
 		}
 
-		doWithJedis(jedis -> {
+		doWithClient(jedis -> {
 			this.transaction = jedis.multi();
 		});
 	}
@@ -586,7 +413,7 @@ public class JedisConnection extends AbstractRedisConnection {
 
 	@Override
 	public void unwatch() {
-		doWithJedis((Consumer<Jedis>) Jedis::unwatch);
+		doWithClient((Consumer<Jedis>) Jedis::unwatch);
 	}
 
 	@Override
@@ -596,7 +423,7 @@ public class JedisConnection extends AbstractRedisConnection {
 			throw new InvalidDataAccessApiUsageException("WATCH is not supported when a transaction is active");
 		}
 
-		doWithJedis(jedis -> {
+		doWithClient(jedis -> {
 			for (byte[] key : keys) {
 				jedis.watch(key);
 			}
@@ -635,7 +462,7 @@ public class JedisConnection extends AbstractRedisConnection {
 			throw new InvalidDataAccessApiUsageException("Cannot subscribe in pipeline / transaction mode");
 		}
 
-		doWithJedis(it -> {
+		doWithClient(it -> {
 
 			JedisMessageListener jedisPubSub = new JedisMessageListener(listener);
 
@@ -656,7 +483,7 @@ public class JedisConnection extends AbstractRedisConnection {
 			throw new InvalidDataAccessApiUsageException("Cannot subscribe in pipeline / transaction mode");
 		}
 
-		doWithJedis(it -> {
+		doWithClient(it -> {
 
 			JedisMessageListener jedisPubSub = new JedisMessageListener(listener);
 
@@ -701,25 +528,6 @@ public class JedisConnection extends AbstractRedisConnection {
 
 	protected Jedis getJedis(RedisNode node) {
 		return new Jedis(new HostAndPort(node.getHost(), node.getPort()), this.sentinelConfig);
-	}
-
-	@Nullable
-	private <T> T doWithJedis(Function<Jedis, T> callback) {
-
-		try {
-			return callback.apply(getJedis());
-		} catch (Exception ex) {
-			throw convertJedisAccessException(ex);
-		}
-	}
-
-	private void doWithJedis(Consumer<Jedis> callback) {
-
-		try {
-			callback.accept(getJedis());
-		} catch (Exception ex) {
-			throw convertJedisAccessException(ex);
-		}
 	}
 
 	private void doExceptionThrowingOperationSafely(ExceptionThrowingOperation operation, String logMessage) {

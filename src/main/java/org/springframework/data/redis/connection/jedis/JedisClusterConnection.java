@@ -15,11 +15,57 @@
  */
 package org.springframework.data.redis.connection.jedis;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.springframework.beans.DirectFieldAccessor;
+import org.springframework.beans.PropertyAccessor;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
+import org.springframework.data.redis.ClusterStateFailureException;
+import org.springframework.data.redis.ExceptionTranslationStrategy;
+import org.springframework.data.redis.FallbackExceptionTranslationStrategy;
+import org.springframework.data.redis.RedisSystemException;
+import org.springframework.data.redis.connection.ClusterCommandExecutor;
+import org.springframework.data.redis.connection.ClusterCommandExecutor.ClusterCommandCallback;
+import org.springframework.data.redis.connection.ClusterCommandExecutor.MultiKeyClusterCommandCallback;
+import org.springframework.data.redis.connection.ClusterCommandExecutor.NodeResult;
+import org.springframework.data.redis.connection.ClusterInfo;
+import org.springframework.data.redis.connection.ClusterNodeResourceProvider;
+import org.springframework.data.redis.connection.ClusterTopology;
+import org.springframework.data.redis.connection.ClusterTopologyProvider;
+import org.springframework.data.redis.connection.MessageListener;
+import org.springframework.data.redis.connection.RedisClusterCommands;
+import org.springframework.data.redis.connection.RedisClusterConnection;
+import org.springframework.data.redis.connection.RedisClusterNode;
+import org.springframework.data.redis.connection.RedisClusterNode.SlotRange;
+import org.springframework.data.redis.connection.RedisClusterServerCommands;
+import org.springframework.data.redis.connection.RedisCommands;
+import org.springframework.data.redis.connection.RedisGeoCommands;
+import org.springframework.data.redis.connection.RedisHashCommands;
+import org.springframework.data.redis.connection.RedisHyperLogLogCommands;
+import org.springframework.data.redis.connection.RedisKeyCommands;
+import org.springframework.data.redis.connection.RedisListCommands;
+import org.springframework.data.redis.connection.RedisScriptingCommands;
+import org.springframework.data.redis.connection.RedisSentinelConnection;
+import org.springframework.data.redis.connection.RedisSetCommands;
+import org.springframework.data.redis.connection.RedisStreamCommands;
+import org.springframework.data.redis.connection.RedisStringCommands;
+import org.springframework.data.redis.connection.RedisSubscribedConnectionException;
+import org.springframework.data.redis.connection.RedisZSetCommands;
+import org.springframework.data.redis.connection.Subscription;
+import org.springframework.data.redis.connection.convert.Converters;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.util.DirectFieldAccessFallbackBeanWrapper;
+import org.springframework.lang.Nullable;
+import org.springframework.util.Assert;
 import redis.clients.jedis.Connection;
 import redis.clients.jedis.ConnectionPool;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisCluster;
+import redis.clients.jedis.PipelineBase;
 import redis.clients.jedis.providers.ClusterConnectionProvider;
 
 import java.time.Duration;
@@ -32,29 +78,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
-
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.springframework.beans.DirectFieldAccessor;
-import org.springframework.beans.PropertyAccessor;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataAccessResourceFailureException;
-import org.springframework.dao.InvalidDataAccessApiUsageException;
-import org.springframework.data.redis.ClusterStateFailureException;
-import org.springframework.data.redis.ExceptionTranslationStrategy;
-import org.springframework.data.redis.FallbackExceptionTranslationStrategy;
-import org.springframework.data.redis.RedisSystemException;
-import org.springframework.data.redis.connection.*;
-import org.springframework.data.redis.connection.ClusterCommandExecutor.ClusterCommandCallback;
-import org.springframework.data.redis.connection.ClusterCommandExecutor.MultiKeyClusterCommandCallback;
-import org.springframework.data.redis.connection.ClusterCommandExecutor.NodeResult;
-import org.springframework.data.redis.connection.RedisClusterNode.SlotRange;
-import org.springframework.data.redis.connection.convert.Converters;
-import org.springframework.data.redis.core.Cursor;
-import org.springframework.data.redis.core.ScanOptions;
-import org.springframework.data.util.DirectFieldAccessFallbackBeanWrapper;
-import org.springframework.lang.Nullable;
-import org.springframework.util.Assert;
 
 /**
  * {@link RedisClusterConnection} implementation on top of {@link JedisCluster}.<br/>
@@ -73,7 +96,7 @@ import org.springframework.util.Assert;
  * @author John Blum
  * @since 1.7
  */
-public class JedisClusterConnection implements RedisClusterConnection {
+public class JedisClusterConnection  extends AbstractPipelineRedisConnection<JedisCluster> implements RedisClusterConnection {
 
 	private static final ExceptionTranslationStrategy EXCEPTION_TRANSLATION = new FallbackExceptionTranslationStrategy(
 			JedisExceptionConverter.INSTANCE);
@@ -630,6 +653,16 @@ public class JedisClusterConnection implements RedisClusterConnection {
 	 * Little helpers to make it work
 	 */
 
+	@Override
+	JedisCluster getClient() {
+		return getCluster();
+	}
+
+	@Override
+	PipelineBase newPipeline() {
+		return cluster.pipelined();
+	}
+
 	protected DataAccessException convertJedisAccessException(Exception cause) {
 
 		DataAccessException translated = EXCEPTION_TRANSLATION.translate(cause);
@@ -664,21 +697,6 @@ public class JedisClusterConnection implements RedisClusterConnection {
 	@Override
 	public boolean isQueueing() {
 		return false;
-	}
-
-	@Override
-	public boolean isPipelined() {
-		return false;
-	}
-
-	@Override
-	public void openPipeline() {
-		throw new InvalidDataAccessApiUsageException("Pipeline is not supported for JedisClusterConnection");
-	}
-
-	@Override
-	public List<Object> closePipeline() throws RedisPipelineException {
-		throw new InvalidDataAccessApiUsageException("Pipeline is not supported for JedisClusterConnection");
 	}
 
 	@Override
